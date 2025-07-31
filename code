@@ -1,0 +1,208 @@
+#include <Wire.h>  // Includes the Wire library for I2C communication
+#include "MAX30105.h"  // Library for MAX30105 Pulse Oximeter sensor
+#include "spo2_algorithm.h"  // SpO2 and Heart Rate calculation algorithm
+#include "Protocentral_MAX30205.h"  // Library for MAX30205 temperature sensor
+#include <Adafruit_GFX.h>  // Graphics library for OLED
+#include <Adafruit_SSD1306.h>  // OLED display driver
+
+// OLED display settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET    -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Sensor objects
+MAX30105 particleSensor;  // Pulse oximeter sensor
+MAX30205 tempSensor;      // Temperature sensor
+
+// Analog pins for mic and ECG
+#define MIC_PIN 33
+#define ECG_PIN 32
+
+// ADC configuration constants
+const float ADC_REF_MIC = 3.3;  // ESP32 reference voltage for mic (3.3V)
+const float ADC_REF_ECG = 3.3;  // ESP32 reference voltage for ECG (3.3V)
+const int ADC_RESOLUTION = 4095;  // 12-bit ADC resolution for ESP32
+
+// Baseline voltages to center signals
+const float MIC_BASELINE_mV = 1650.0;  // Midpoint for microphone signal
+const float ECG_BASELINE_mV = 1650.0;  // Midpoint for ECG signal
+
+// Buffers for SpO2 and HR data
+uint32_t irBuffer[100];   // Infrared LED readings
+uint32_t redBuffer[100];  // Red LED readings
+int32_t bufferLength = 100;
+int32_t spo2;
+int8_t validSPO2;
+int32_t heartRate;
+int8_t validHeartRate;
+float tempC = 0;  // Temperature in Celsius
+
+// Setup runs once at boot
+void setup() {
+  Serial.begin(115200);     // Start serial communication
+  delay(500);               // Give time for serial monitor to open
+
+  Wire.begin(21, 22);       // I2C pins for ESP32 (SDA=21, SCL=22)
+
+  initOLED();               // Initialize OLED display
+  initSpO2Sensor();         // Initialize MAX30105 sensor
+  initTempSensor();         // Initialize MAX30205 sensor
+}
+
+// Main loop runs continuously
+void loop() {
+  readSpO2();        // Update SpO2 and Heart Rate data
+  readTemperature(); // Read temperature sensor
+  updateOLED();      // Show readings on OLED
+  plotMicAndECG();   // Plot microphone and ECG data to Serial Plotter
+  delay(1);          // Small delay to ease serial buffer
+}
+
+// Function to read and print mic + ECG data
+void plotMicAndECG() {
+  int micRaw = analogRead(MIC_PIN);  // Raw analog value from mic
+  int ecgRaw = analogRead(ECG_PIN);  // Raw analog value from ECG
+
+  // Convert to millivolts
+  float mic_mV = (micRaw / (float)ADC_RESOLUTION) * ADC_REF_MIC * 1000.0;
+  float ecg_mV = (ecgRaw / (float)ADC_RESOLUTION) * ADC_REF_ECG * 1000.0;
+
+  // Center signals around 0V (remove DC bias)
+  float mic_mV_centered = mic_mV - MIC_BASELINE_mV;
+  float ecg_mV_centered = ecg_mV - ECG_BASELINE_mV;
+
+  // Send to Serial Plotter
+  // Blue (first column) will be ECG
+  // Orange (second column) will be MIC
+  Serial.print(ecg_mV_centered);  // ECG → Blue plot
+  Serial.print("\t");
+  Serial.println(mic_mV_centered);  // MIC → Orange plot
+}
+
+// OLED initialization
+void initOLED() {
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 allocation failed");
+    while (1);  // Stop here if OLED fails
+  }
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+}
+
+// Update OLED with sensor values
+void updateOLED() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.println("GEMINEX Health Care");
+
+  // Display Heart Rate
+  display.print("HR: ");
+  if (validHeartRate)
+    display.print(heartRate / 2);  // Divide if readings are doubled
+  else
+    display.print("--");
+  display.println(" bpm");
+
+  // Display SpO2
+  display.print("SpO2: ");
+  if (validSPO2)
+    display.print(spo2);
+  else
+    display.print("--");
+  display.println(" %");
+
+  // Display temperature
+  display.print("Temp: ");
+  display.print(tempC, 1);  // One decimal place
+  display.println(" C");
+
+  display.display();  // Send buffer to screen
+}
+
+// Configure MAX30105 SpO2 sensor
+void initSpO2Sensor() {
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) {
+    Serial.println("MAX30105 not found");
+    while (1);  // Stop if sensor not detected
+  }
+
+  particleSensor.softReset();  // Reset the sensor
+  delay(100);
+  particleSensor.shutDown();   // Put sensor in low power
+  delay(100);
+  particleSensor.wakeUp();     // Wake it back up
+
+  // Setup with standard parameters
+  particleSensor.setup(50, 4, 2, 100, 411, 4096);
+  particleSensor.setPulseAmplitudeRed(0x10);  // Set Red LED intensity
+  particleSensor.setPulseAmplitudeIR(0x10);   // Set IR LED intensity
+}
+
+// Read and calculate HR and SpO2
+void readSpO2() {
+  static bool firstRun = true;
+
+  if (firstRun) {
+    // Fill entire buffer on first run
+    for (byte i = 0; i < bufferLength; i++) {
+      waitForSample();  // Wait for new data
+      redBuffer[i] = particleSensor.getRed();
+      irBuffer[i] = particleSensor.getIR();
+      particleSensor.nextSample();
+    }
+
+    // Run SpO2 algorithm
+    maxim_heart_rate_and_oxygen_saturation(
+      irBuffer, bufferLength, redBuffer,
+      &spo2, &validSPO2, &heartRate, &validHeartRate);
+    firstRun = false;
+  }
+
+  // Shift old data
+  for (byte i = 25; i < 100; i++) {
+    redBuffer[i - 25] = redBuffer[i];
+    irBuffer[i - 25] = irBuffer[i];
+  }
+
+  // Read new 25 samples
+  for (byte i = 75; i < 100; i++) {
+    waitForSample();
+    redBuffer[i] = particleSensor.getRed();
+    irBuffer[i] = particleSensor.getIR();
+    particleSensor.nextSample();
+  }
+
+  // Re-run algorithm
+  maxim_heart_rate_and_oxygen_saturation(
+    irBuffer, bufferLength, redBuffer,
+    &spo2, &validSPO2, &heartRate, &validHeartRate);
+}
+
+// Waits for new data from MAX30105
+void waitForSample() {
+  unsigned long t0 = millis();
+  while (!particleSensor.available()) {
+    particleSensor.check();  // Check if sample ready
+    if (millis() - t0 > 1000) break;  // Timeout after 1s
+  }
+}
+
+// Initializes the MAX30205 temperature sensor
+void initTempSensor() {
+  tempSensor.begin();  // Start communication with temperature sensor
+}
+
+// Reads temperature in Celsius
+void readTemperature() {
+  tempC = tempSensor.getTemperature();  // Read temperature value
+}
+
+
+🔵 Blue Line → ECG
+🟠 Orange Line → MIC
